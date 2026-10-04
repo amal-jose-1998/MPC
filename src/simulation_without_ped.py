@@ -55,7 +55,7 @@ def simulate(df):
     # Following vehicles
     for i in range(1, n_vehicles):
         if vehicle_types[i] == "AV":
-            acceleration, optimal_sequence = compute_av_acceleration(
+            acceleration, optimal_sequence, diagnostics = compute_av_acceleration(
                 current_position=positions[i],
                 current_speed=speeds[i],
                 leader_position=positions[i - 1],
@@ -133,7 +133,7 @@ def simulate(df):
         # Following vehicles
         for i in range(1, n_vehicles):
             if vehicle_types[i] == "AV":
-                acceleration, optimal_sequence = compute_av_acceleration(
+                acceleration, optimal_sequence, diagnostics = compute_av_acceleration(
                     current_position=new_positions[i],
                     current_speed=new_speeds[i],
                     leader_position=new_positions[i - 1],

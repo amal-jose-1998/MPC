@@ -94,6 +94,9 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
     The optimizer chooses a sequence of accelerations over the MPC horizon. 
     Only the first acceleration is applied by the simulation. The full optimal sequence is returned so it can be stored and shifted at the next step.
     """
+    # -------------------------------------------------
+    # Warm-start initial guess
+    # -------------------------------------------------
     if previous_optimal_sequence is not None:
         previous_optimal_sequence = np.asarray(previous_optimal_sequence, dtype=float)
 
@@ -114,10 +117,13 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
     
     initial_guess = np.clip(initial_guess, AV_ACCEL_MIN, AV_ACCEL_MAX) # ensure the initial guess is within the AV acceleration limits
 
+    # -------------------------------------------------
+    # MPC optimization
+    # -------------------------------------------------
     result = minimize(
         _objective,
         initial_guess,
-        args=(current_position, current_speed, previous_acceleration),
+        args=(current_position, current_speed, previous_acceleration, leader_position, leader_speed, leader_acceleration),
         method="SLSQP",
         bounds=[(AV_ACCEL_MIN, AV_ACCEL_MAX)] * MPC_HORIZON,
         constraints={
@@ -137,11 +143,36 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
         },
     )
 
+    # Evaluate the candidate returned by SLSQP.
+    candidate = (np.asarray(result.x, dtype=float)
+        if hasattr(result, "x")
+        else initial_guess
+    )
+    constraint_values = _constraint_values(candidate, current_position, current_speed, leader_position, leader_speed, leader_acceleration)
+    speed_margins = constraint_values[:2 * MPC_HORIZON] # The first 2 * MPC_HORIZON values correspond to speed constraints.
+    gap_margins = constraint_values[2 * MPC_HORIZON:]   # The last MPC_HORIZON values correspond to gap constraints.
+    diagnostics = {
+        "success": bool(result.success),
+        "status": int(result.status),
+        "message": str(result.message),
+        "objective": float(result.fun)
+        if np.isfinite(result.fun)
+        else np.inf,
+        "min_constraint_margin": float(np.min(constraint_values)),
+        "min_speed_margin": float(np.min(speed_margins)),
+        "min_gap_margin": float(np.min(gap_margins)),
+        "iterations": int(getattr(result, "nit", -1)),
+        "initial_guess": initial_guess.copy(),
+    }
+
     # If optimization fails, use a safe bounded fallback.
     if not result.success:
         fallback_acceleration = float(np.clip(previous_acceleration, AV_ACCEL_MIN, AV_ACCEL_MAX))
-        return fallback_acceleration, initial_guess
+        diagnostics["optimal_sequence"] = None
+        diagnostics["fallback_acceleration"] = fallback_acceleration
+        return fallback_acceleration, initial_guess, diagnostics
     
     optimal_sequence = np.clip(result.x, AV_ACCEL_MIN, AV_ACCEL_MAX)
+    diagnostics["optimal_sequence"] = optimal_sequence.copy()
 
-    return float(optimal_sequence[0]), optimal_sequence
+    return float(optimal_sequence[0]), optimal_sequence, diagnostics
