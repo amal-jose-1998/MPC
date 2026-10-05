@@ -1,4 +1,5 @@
 from .config import (
+    HDV_ACCEL_MIN,
     PEDESTRIAN_TIME,
     PEDESTRIAN_POSITION,
     PEDESTRIAN_DURATION,
@@ -120,10 +121,13 @@ def calculate_hdv_pedestrian_acceleration(vehicle_position, vehicle_speed, pedes
     # ACTIVE PHASE
     # -------------------------------------------------
     if pedestrian_state == "active":
-        # The pedestrian is actually present. Strong braking is required if the HDV is inside the required stopping distance.
-        if distance_to_pedestrian <= required_distance:
-            return PEDESTRIAN_HDV_ACTIVE_BRAKE
+        distance_to_stop = pedestrian_position - vehicle_position
 
-        return None
+        # Already beyond the pedestrian.
+        if distance_to_stop <= 0.0:
+            return None
+
+        # Braking acceleration required to stop at the safe stopping position.
+        return max((-(vehicle_speed ** 2) / (2.0 * distance_to_stop)), HDV_ACCEL_MIN)
 
     return None

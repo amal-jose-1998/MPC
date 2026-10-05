@@ -79,6 +79,7 @@ def simulate(df):
         )
         if pedestrian_acceleration is not None:
             leader_acceleration = min(leader_acceleration, pedestrian_acceleration)
+            pedestrian_acceleration_history[0, 0] = pedestrian_acceleration
 
         acceleration_history[0, 0] = leader_acceleration
 
@@ -114,6 +115,7 @@ def simulate(df):
 
             if pedestrian_acceleration is not None:
                 hdv_acceleration = min(hdv_acceleration, pedestrian_acceleration)
+                pedestrian_acceleration_history[0, i] = pedestrian_acceleration
 
             acceleration_history[0, i] = hdv_acceleration
 
@@ -190,6 +192,7 @@ def simulate(df):
 
             if pedestrian_acceleration is not None:
                 leader_acceleration = min(leader_acceleration, pedestrian_acceleration)
+                pedestrian_acceleration_history[k, 0] = pedestrian_acceleration
 
             acceleration_history[k, 0] = leader_acceleration
 
@@ -226,6 +229,7 @@ def simulate(df):
 
                 if pedestrian_acceleration is not None:
                     hdv_acceleration = min(hdv_acceleration, pedestrian_acceleration)
+                    pedestrian_acceleration_history[k, i] = pedestrian_acceleration
 
                 acceleration_history[k, i] = hdv_acceleration
 
@@ -246,6 +250,7 @@ def simulate(df):
         "mpc_diagnostics": mpc_diagnostics,
         "pedestrian_state": pedestrian_state_history,
         "pedestrian_position": PEDESTRIAN_POSITION,
+        "pedestrian_acceleration": pedestrian_acceleration_history,
     }
 
 
