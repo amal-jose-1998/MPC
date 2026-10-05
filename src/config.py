@@ -23,6 +23,12 @@ PEDESTRIAN_POSITION = 400.0  # [m]
 PEDESTRIAN_DURATION = 10.0   # [s]
 PEDESTRIAN_WARNING_DURATION = 2.0   # Warning before pedestrian becomes active [s]
 
+# HDV pedestrian response
+PEDESTRIAN_HDV_WARNING_BRAKE = -1.0    # [m/s²]
+PEDESTRIAN_HDV_ACTIVE_BRAKE = -3.0     # [m/s²]
+PEDESTRIAN_HDV_REACTION_TIME = 1.5     # [s] Driver reaction time used for stopping-distance calculation
+PEDESTRIAN_HDV_SAFE_DISTANCE = 5.0     # [m] Extra distance maintained before crossing
+
 # Visualization
 WINDOW_MARGIN = 50.0     # Margin around traffic for plots [m]
 
