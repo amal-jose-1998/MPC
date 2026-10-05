@@ -31,6 +31,9 @@ def simulate(df):
     acceleration_history = np.zeros((n_steps, n_vehicles))
     gap_history = np.full((n_steps, n_vehicles), np.nan)
 
+    # MPC diagnostics for every timestep and vehicle.
+    mpc_diagnostics = [[None for _ in range(n_vehicles)] for _ in range(n_steps)]
+
     # =================================================
     # k = 0
     # =================================================
@@ -66,6 +69,7 @@ def simulate(df):
             )
             acceleration_history[0, i] = acceleration
             previous_optimal_sequences[i] = optimal_sequence
+            mpc_diagnostics[0][i] = diagnostics
         else:
             acceleration_history[0, i] = HDVDynamics.calculate_acceleration(speeds[i], speeds[i - 1], gap_history[0, i])
 
@@ -105,6 +109,7 @@ def simulate(df):
                 # No rule-based AV gap correction.
                 new_positions[i] = VehicleDynamics.update_position(previous_positions[i], previous_speeds[i])
             else:
+                # HDV retains its existing gap-enforcing dynamics.
                 new_positions[i], constrained_speed = HDVDynamics.update_position(previous_positions[i], previous_speeds[i], new_positions[i - 1], MIN_GAP)
 
                 # If the gap constraint changed the position, update the speed so that the position and speed remain consistent.
@@ -143,6 +148,7 @@ def simulate(df):
                     previous_optimal_sequence=previous_optimal_sequences[i],
                 )
                 acceleration_history[k, i] = acceleration
+                mpc_diagnostics[k][i] = diagnostics
                 previous_optimal_sequences[i] = optimal_sequence
             else:
                 acceleration_history[k, i] = HDVDynamics.calculate_acceleration(new_speeds[i], new_speeds[i - 1], gap_history[k, i])
@@ -161,4 +167,54 @@ def simulate(df):
         "accelerations": acceleration_history,
         "gaps": gap_history,
         "vehicle_types": vehicle_types,
+        "mpc_diagnostics": mpc_diagnostics,
     }
+
+
+def trace_av_failures(results, vehicle_index=10):
+    """Print the first few MPC failures for a selected AV."""
+    diagnostics_history = results["mpc_diagnostics"] 
+    positions = results["positions"]
+    speeds = results["speeds"]
+    accelerations = results["accelerations"]
+    gaps = results["gaps"]
+    vehicle_types = results["vehicle_types"]
+    time = results["time"]
+
+    print(f"\n=== MPC failure trace: vehicle {vehicle_index} ({vehicle_types[vehicle_index]}) ===")
+
+    failure_count = 0
+
+    for k, row in enumerate(diagnostics_history):
+        d = row[vehicle_index]
+
+        if d is None or d["success"]:
+            continue
+
+        print(f"\nFailure #{failure_count + 1} at t = {time[k]:.1f} s")
+        print(f"  current position       : {positions[k, vehicle_index]:.3f} m")
+        print(f"  current speed          : {speeds[k, vehicle_index]:.3f} m/s")
+        print(f"  current acceleration   : {accelerations[k, vehicle_index]:.3f} m/s²")
+        print(f"  current gap            : {gaps[k, vehicle_index]:.3f} m")
+        print(f"  objective              : {d['objective']:.6f}")
+        print(f"  status                 : {d['status']}")
+        print(f"  message                : {d['message']}")
+        print(f"  iterations             : {d['iterations']}")
+        print(f"  min speed margin       : {d['min_speed_margin']:.6f}")
+        print(f"  min gap margin         : {d['min_gap_margin']:.6f}")
+        print(f"  min constraint margin  : {d['min_constraint_margin']:.6f}")
+        print(f"  warm-start guess       : {np.asarray(d['initial_guess'])}")
+
+        if "fallback_acceleration" in d:
+            print(f"  fallback acceleration  : {d['fallback_acceleration']:.3f} m/s²")
+
+        failure_count += 1
+
+        if failure_count >= 5:
+            print("\n... failures more than 5, stopping ...")
+            break
+
+    if failure_count == 0:
+        print("No MPC failures found.")
+
+    return failure_count

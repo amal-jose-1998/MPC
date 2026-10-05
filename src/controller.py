@@ -4,6 +4,7 @@ import numpy as np
 from scipy.optimize import minimize
 
 from .config import (
+    DT,
     MPC_HORIZON,
     AV_ACCEL_MIN,
     AV_ACCEL_MAX,
@@ -60,7 +61,8 @@ def _objective(acceleration_sequence, current_position, current_speed, previous_
 
     # Penalize changes in acceleration
     acceleration_changes = np.diff(np.concatenate(([previous_acceleration], acceleration_sequence))) # calculate changes in acceleration, including the previous acceleration; total length = MPC_HORIZON
-    smoothness_cost = AV_SMOOTHNESS_WEIGHT * np.sum(acceleration_changes ** 2)
+    jerk = np.diff(acceleration_changes) / DT
+    jerk_cost = (AV_SMOOTHNESS_WEIGHT * np.sum(jerk ** 2) * DT) #
 
     # penalize predicted time headway below the target.
     gaps = leader_positions - av_positions - VEHICLE_LENGTH
@@ -69,7 +71,7 @@ def _objective(acceleration_sequence, current_position, current_speed, previous_
     headway_deficit = np.maximum(0.0, AV_HEADWAY_TARGET - time_headways) # penalize only when the predicted time headway is below the target
     safety_cost = AV_HEADWAY_WEIGHT * np.sum(headway_deficit ** 2)
 
-    return speed_cost + smoothness_cost + safety_cost
+    return speed_cost + jerk_cost + safety_cost
 
 
 def _constraint_values(acceleration_sequence, current_position, current_speed, leader_position, leader_speed, leader_acceleration):
@@ -163,6 +165,7 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
         "min_gap_margin": float(np.min(gap_margins)),
         "iterations": int(getattr(result, "nit", -1)),
         "initial_guess": initial_guess.copy(),
+        "optimal_sequence": None,
     }
 
     # If optimization fails, use a safe bounded fallback.
