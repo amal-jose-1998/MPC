@@ -6,6 +6,15 @@ from .dynamics import calculate_gap, VehicleDynamics, HDVDynamics
 from .controller import compute_av_acceleration
 
 
+def _compute_leader_acceleration(speed):
+    """Compute the leader acceleration from the configured leader model."""
+    if LEADER_MODE == "constant":
+        return 0.0
+    if LEADER_MODE == "desired_speed":
+        return HDVDynamics.calculate_leader_acceleration(speed, LEADER_DESIRED_SPEED)
+    raise ValueError(f"Unknown LEADER_MODE: {LEADER_MODE}")
+
+
 def simulate(df):
     """
     Simulate mixed traffic with HDV car-following and AV MPC control.
@@ -44,16 +53,8 @@ def simulate(df):
     for i in range(1, n_vehicles):
         gap_history[0, i] = calculate_gap(positions[i - 1], positions[i])
     
-    # Initial accelerations
-    # Leader
-    if LEADER_MODE == "constant":
-        acceleration_history[0, 0] = 0.0
-
-    elif LEADER_MODE == "desired_speed":
-        acceleration_history[0, 0] = HDVDynamics.calculate_leader_acceleration(speeds[0], LEADER_DESIRED_SPEED)
-
-    else:
-        raise ValueError(f"Unknown LEADER_MODE: {LEADER_MODE}")
+    # Initial acceleration of the leader.
+    acceleration_history[0, 0] = _compute_leader_acceleration(speeds[0])
 
     # Following vehicles
     for i in range(1, n_vehicles):
@@ -77,7 +78,6 @@ def simulate(df):
     # Simulation loop: k = 1, 2, ..., n_steps-1
     # =================================================
     for k in range(1, n_steps):
-
         # Previous state: k - 1
         previous_positions = position_history[k - 1]
         previous_speeds = speed_history[k - 1]
@@ -126,14 +126,7 @@ def simulate(df):
         # 4. Calculate acceleration at k
         # =================================================
         # Leader
-        if LEADER_MODE == "constant":
-            acceleration_history[k, 0] = 0.0
-
-        elif LEADER_MODE == "desired_speed":
-            acceleration_history[k, 0] = HDVDynamics.calculate_leader_acceleration(new_speeds[0], LEADER_DESIRED_SPEED)
-
-        else:
-            raise ValueError(f"Unknown LEADER_MODE: {LEADER_MODE}")
+        acceleration_history[k, 0] = _compute_leader_acceleration(new_speeds[0])
 
         # Following vehicles
         for i in range(1, n_vehicles):

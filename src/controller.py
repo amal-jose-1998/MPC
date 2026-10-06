@@ -50,21 +50,19 @@ def _prediction_matrices(horizon, dt):
     position_coeff = np.maximum(idx[:, None] - idx[None, :], 0.0)
     jx = (dt ** 2) * position_coeff
 
-    # Acceleration-change matrix for
-    #   da = diff([previous_acceleration, a]).
-    d_acc = np.eye(n, dtype=float)
-    if n > 1:
-        d_acc[np.arange(1, n), np.arange(n - 1)] = -1.0 
+    # Jerk Jacobian
+    # jerk[0] = (a[0] - previous_acceleration) / dt
+    # jerk[k] = (a[k] - a[k-1]) / dt
+    # Therefore J_JERK has shape (n, n).
 
-    # Jerk = diff(acceleration_changes) / dt.
+    jjerk = np.zeros((n, n), dtype=float)
+
+    jjerk[0, 0] = 1.0 / dt
+
     if n > 1:
-        d_diff = np.zeros((n - 1, n), dtype=float)
-        rows_j = np.arange(n - 1)
-        d_diff[rows_j, rows_j] = -1.0
-        d_diff[rows_j, rows_j + 1] = 1.0
-        jjerk = (d_diff @ d_acc) / dt
-    else:
-        jjerk = np.empty((0, n), dtype=float)
+        rows = np.arange(1, n)
+        jjerk[rows, rows] = 1.0 / dt
+        jjerk[rows, rows - 1] = -1.0 / dt
 
     return jv, jx, jjerk
 
@@ -100,12 +98,14 @@ def _predict_leader(current_position, current_speed, current_acceleration, horiz
     steps = np.arange(1, horizon + 1, dtype=float)
     speeds = np.clip(current_speed + DT * current_acceleration * steps, 0.0, HDV_SPEED_MAX,)
 
-    # Same integration convention as the simulation:
     # x[k+1] = x[k] + v[k] * DT.
     positions = (
         current_position
-        + current_speed * DT * steps
-        + 0.5 * current_acceleration * (DT ** 2) * steps * (steps - 1.0)
+        + DT * np.cumsum(
+            np.concatenate(
+                ([current_speed], speeds[:-1])
+            )
+        )
     )
 
     return positions, speeds
@@ -198,7 +198,7 @@ def _constraint_values(acceleration_sequence, current_position, current_speed, l
     """Return speed and minimum-gap constraint margins."""
     av_positions, av_speeds = _predict_av(current_position, current_speed, acceleration_sequence)
 
-    speed_margins = np.concatenate(av_speeds, AV_SPEED_MAX - av_speeds)
+    speed_margins = np.concatenate((av_speeds, AV_SPEED_MAX - av_speeds))
 
     gaps = leader_positions - av_positions - VEHICLE_LENGTH
     gap_margins = gaps - MIN_GAP
@@ -251,7 +251,7 @@ def compute_av_acceleration(
         previous_optimal_sequence = np.asarray(previous_optimal_sequence, dtype=float)
 
         if previous_optimal_sequence.shape == (horizon,):
-            initial_guess = np.concatenate(previous_optimal_sequence[1:], [previous_optimal_sequence[-1]])
+            initial_guess = np.concatenate((previous_optimal_sequence[1:], [previous_optimal_sequence[-1]]))
         else:
             initial_guess = np.full(horizon, previous_acceleration, dtype=float)
     else:
