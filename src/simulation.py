@@ -1,28 +1,84 @@
 import numpy as np
-import pandas as pd
 
 from .config import (
     DT,
+    PEDESTRIAN_POSITION,
     SIM_TIME,
     LEADER_MODE,
     LEADER_DESIRED_SPEED,
     MIN_GAP,
-    PEDESTRIAN_POSITION,
 )
-from .dynamics import calculate_gap, VehicleDynamics, HDVDynamics
-from .controller import compute_av_acceleration
+
+from .dynamics import (
+    calculate_gap,
+    VehicleDynamics,
+    HDVDynamics
+)
 from .pedestrian import (
     get_pedestrian_state,
     calculate_hdv_pedestrian_acceleration,
+    apply_pedestrian_wall,
+    calculate_queue_stop_target,
+    X_STOP,
+    MODE_FREE,
 )
 
+
+def _compute_accelerations(positions, speeds, gaps, time, state, modes, pedestrian_acceleration_row):
+    """
+    Acceleration of every vehicle at one time step.
+    Leader: leader model (constant / desired speed). Followers: car following.
+    All vehicles: min(normal acceleration, pedestrian braking). Updates modes in place.
+    Returns (accelerations, list of infeasible vehicle indices).
+    """
+    n_vehicles = len(positions)
+    accelerations = np.zeros(n_vehicles)
+    infeasible = []
+    stop_targets = np.full(n_vehicles, X_STOP)
+ 
+    for i in range(n_vehicles):
+        if i == 0:
+            if LEADER_MODE == "constant":
+                normal_acceleration = 0.0
+            elif LEADER_MODE == "desired_speed":
+                normal_acceleration = HDVDynamics.calculate_leader_acceleration(speeds[0], LEADER_DESIRED_SPEED)
+            else:
+                raise ValueError(f"Unknown LEADER_MODE: {LEADER_MODE}")
+        else:
+            normal_acceleration = HDVDynamics.calculate_acceleration(speeds[i], speeds[i - 1], gaps[i])
+ 
+        if i > 0:
+            stop_targets[i] = calculate_queue_stop_target(modes[i - 1], stop_targets[i - 1])
+ 
+        pedestrian_acceleration, modes[i], is_infeasible = calculate_hdv_pedestrian_acceleration(
+            vehicle_position=positions[i],
+            vehicle_speed=speeds[i],
+            time=time,
+            pedestrian_state=state,
+            mode=modes[i],
+            stop_target=stop_targets[i],
+        )
+        if is_infeasible:
+            infeasible.append(i)
+ 
+        if pedestrian_acceleration is not None:
+            # Pedestrian braking overrides normal behaviour whenever it requires stronger braking
+            accelerations[i] = min(normal_acceleration, pedestrian_acceleration)
+            pedestrian_acceleration_row[i] = pedestrian_acceleration
+        else:
+            accelerations[i] = normal_acceleration
+ 
+    return accelerations, infeasible
 
 
 def simulate(df):
     """
-    Simulate mixed traffic with HDV car-following and AV MPC control.
+    Simulate the all-HDV traffic scenario.
+    Vehicle 0 is the leader (leader model). The others use HDV car following.
+    Every vehicle behind the crossing treats the pedestrian as a virtual stopped obstacle
     """
     vehicles = df.copy().reset_index(drop=True)
+
     n_vehicles = len(vehicles)
     n_steps = int(SIM_TIME / DT) + 1
 
@@ -33,9 +89,6 @@ def simulate(df):
     speeds = vehicles["speed_mps"].to_numpy(dtype=float)
     vehicle_types = vehicles["type"].to_numpy()
 
-    # One warm-start sequence per AV.
-    previous_optimal_sequences = {i: None for i in range(n_vehicles) if vehicle_types[i] == "AV"}
-
     # Store simulation history
     time_history = np.zeros(n_steps)
     position_history = np.zeros((n_steps, n_vehicles))
@@ -43,88 +96,41 @@ def simulate(df):
     acceleration_history = np.zeros((n_steps, n_vehicles))
     gap_history = np.full((n_steps, n_vehicles), np.nan)
 
-    pedestrian_state_history = np.empty(n_steps, dtype=object)             # Pedestrian state at every simulation timestep.
+    # Pedestrian diagnostics
+    pedestrian_state_history = np.empty(n_steps, dtype=object)
     pedestrian_acceleration_history = np.full((n_steps, n_vehicles), np.nan)
-
-    # MPC diagnostics for every timestep and vehicle.
-    mpc_diagnostics = [[None for _ in range(n_vehicles)] for _ in range(n_steps)]
+    mode_history = np.zeros((n_steps, n_vehicles), dtype=int)
+    wall_hit_history = np.zeros((n_steps, n_vehicles), dtype=bool)
+    infeasible_events = []     # (time, vehicle index, position, speed)
+ 
+    modes = np.full(n_vehicles, MODE_FREE, dtype=int)
 
     # =================================================
     # k = 0
     # =================================================
-    time_history[0] = 0.0
     position_history[0] = positions
     speed_history[0] = speeds
-    pedestrian_state_history[0] = get_pedestrian_state(time_history[0])
+    pedestrian_state_history[0] = get_pedestrian_state(0.0)
     
     # Initial gaps
     for i in range(1, n_vehicles):
         gap_history[0, i] = calculate_gap(positions[i - 1], positions[i])
+
     
     # Initial accelerations
-    # Leader
-    if LEADER_MODE == "constant":
-        acceleration_history[0, 0] = 0.0
-
-    elif LEADER_MODE == "desired_speed":
-        leader_acceleration = HDVDynamics.calculate_leader_acceleration(speeds[0], LEADER_DESIRED_SPEED)
-        # The front-most vehicle has no leader. Therefore, if the pedestrian is ahead of it, it must react directly. 
-        pedestrian_acceleration = (
-            calculate_hdv_pedestrian_acceleration(
-                vehicle_position=positions[0],
-                vehicle_speed=speeds[0],
-                pedestrian_state=pedestrian_state_history[0],
-                pedestrian_position=PEDESTRIAN_POSITION,
-                leader_position=None,
-            )
-        )
-        if pedestrian_acceleration is not None:
-            leader_acceleration = min(leader_acceleration, pedestrian_acceleration)
-            pedestrian_acceleration_history[0, 0] = pedestrian_acceleration
-
-        acceleration_history[0, 0] = leader_acceleration
-
-    else:
-        raise ValueError(f"Unknown LEADER_MODE: {LEADER_MODE}")
-
-    # Following vehicles
-    for i in range(1, n_vehicles):
-#        if vehicle_types[i] == "AV":
-#            acceleration, optimal_sequence, diagnostics = compute_av_acceleration(
-#                current_position=positions[i],
-#                current_speed=speeds[i],
-#                leader_position=positions[i - 1],
-#                leader_speed=speeds[i - 1],
-#                leader_acceleration=acceleration_history[0, i - 1],
-#                previous_acceleration=0.0,
-#                previous_optimal_sequence=None,
-#            )
-#            acceleration_history[0, i] = acceleration
-#            previous_optimal_sequences[i] = optimal_sequence
-#            mpc_diagnostics[0][i] = diagnostics
-#        else:
-            # Normal HDV car-following acceleration
-            hdv_acceleration = HDVDynamics.calculate_acceleration(speeds[i], speeds[i - 1], gap_history[0, i])
-            # Pedestrian response for a following HDV. The pedestrian must be between this HDV and its leader. 
-            pedestrian_acceleration = calculate_hdv_pedestrian_acceleration(
-                vehicle_position=positions[i],
-                vehicle_speed=speeds[i],
-                pedestrian_state=pedestrian_state_history[0],
-                pedestrian_position=PEDESTRIAN_POSITION,
-                leader_position=positions[i - 1],
-            )
-
-            if pedestrian_acceleration is not None:
-                hdv_acceleration = min(hdv_acceleration, pedestrian_acceleration)
-                pedestrian_acceleration_history[0, i] = pedestrian_acceleration
-
-            acceleration_history[0, i] = hdv_acceleration
+    acceleration_history[0], infeasible = _compute_accelerations(
+        positions, speeds, gap_history[0], 0.0, pedestrian_state_history[0], modes, pedestrian_acceleration_history[0]
+    )
+    mode_history[0] = modes
+    for i in infeasible:
+        infeasible_events.append((0.0, i, positions[i], speeds[i]))
 
     # =================================================
     # Simulation loop: k = 1, 2, ..., n_steps-1
     # =================================================
     for k in range(1, n_steps):
         # Previous state: k - 1
+        current_time = k * DT
         previous_positions = position_history[k - 1]
         previous_speeds = speed_history[k - 1]
         previous_accelerations = acceleration_history[k - 1]
@@ -134,36 +140,32 @@ def simulate(df):
         new_positions = np.zeros(n_vehicles)
 
         # =================================================
-        # 1. State propagation: speed.  (v(k) = v(k-1) + a(k-1) * DT)
+        # 1. Calculate speed at k: v(k) = v(k-1) + a(k-1) * DT
         # =================================================
         for i in range(n_vehicles):
-#            if vehicle_types[i] == "AV":
-#                # Pure AV dynamics: execute the acceleration selected by MPC.
-#                new_speeds[i] = VehicleDynamics.update_velocity(previous_speeds[i], previous_accelerations[i])
-#            else:
-                new_speeds[i] = HDVDynamics.update_velocity(previous_speeds[i], previous_accelerations[i])
+            new_speeds[i] = HDVDynamics.update_velocity(previous_speeds[i], previous_accelerations[i])
 
         # =================================================
-        # 2. State propagation: position.  (x(k) = x(k-1) + v(k-1) * DT)
+        # 2. Calculate position at k: x(k) = x(k-1) + v(k-1) * DT
         # =================================================
-        # Leader
-        new_positions[0] = VehicleDynamics.update_position(previous_positions[0], previous_speeds[0])
-
-        # Following vehicles
-        for i in range(1, n_vehicles):
-            if vehicle_types[i] == "AV":
-                # No rule-based AV gap correction.
-                new_positions[i] = VehicleDynamics.update_position(previous_positions[i], previous_speeds[i])
+        for i in range(n_vehicles):
+            if i == 0:
+                new_positions[0] = VehicleDynamics.update_position(previous_positions[0], previous_speeds[0])
+            
             else:
-                # HDV retains its existing gap-enforcing dynamics.
                 new_positions[i], constrained_speed = HDVDynamics.update_position(previous_positions[i], previous_speeds[i], new_positions[i - 1], MIN_GAP)
 
                 # If the gap constraint changed the position, update the speed so that the position and speed remain consistent.
                 if constrained_speed is not None:
                     new_speeds[i] = constrained_speed
 
+            new_positions[i], wall_speed, wall_hit = apply_pedestrian_wall(new_positions[i], previous_positions[i], current_time)
+            if wall_hit:
+                new_speeds[i] = wall_speed
+                wall_hit_history[k, i] = True
+
         # =================================================
-        # 3. Calculate gaps at k for evaluation and HDV control: g(k) = x_leader(k) - x_follower(k) - L
+        # 3. Calculate gaps at k: g(k) = x_leader(k) - x_follower(k) - L
         # =================================================
         for i in range(1, n_vehicles):
             gap_history[k, i] = calculate_gap(new_positions[i - 1], new_positions[i])
@@ -171,73 +173,19 @@ def simulate(df):
         # =================================================
         # 4. Calculate acceleration at k
         # =================================================
-        time_history[k] = k * DT # Current simulation time.
-        pedestrian_state_history[k] = get_pedestrian_state(time_history[k]) # Current pedestrian state.
-
-        # Leader
-        if LEADER_MODE == "constant":
-            acceleration_history[k, 0] = 0.0
-
-        elif LEADER_MODE == "desired_speed":
-            leader_acceleration = HDVDynamics.calculate_leader_acceleration(new_speeds[0], LEADER_DESIRED_SPEED)
-            # The leader has no vehicle ahead of it. Therefore, the pedestrian can directly affect it when the pedestrian is ahead of the leader.
-            pedestrian_acceleration = (
-                calculate_hdv_pedestrian_acceleration(
-                    vehicle_position=new_positions[0],
-                    vehicle_speed=new_speeds[0],
-                    pedestrian_state=pedestrian_state_history[k],
-                    pedestrian_position=PEDESTRIAN_POSITION,
-                    leader_position=None,
-                )
-            )
-
-            if pedestrian_acceleration is not None:
-                leader_acceleration = min(leader_acceleration, pedestrian_acceleration)
-                pedestrian_acceleration_history[k, 0] = pedestrian_acceleration
-
-            acceleration_history[k, 0] = leader_acceleration
-
-
-        else:
-            raise ValueError(f"Unknown LEADER_MODE: {LEADER_MODE}")
-
-        # Following vehicles
-        for i in range(1, n_vehicles):
-#            if vehicle_types[i] == "AV":
-#                acceleration, optimal_sequence, diagnostics = compute_av_acceleration(
-#                    current_position=new_positions[i],
-#                    current_speed=new_speeds[i],
-#                    leader_position=new_positions[i - 1],
-#                    leader_speed=new_speeds[i - 1],
-#                    leader_acceleration=acceleration_history[k, i - 1],
-#                    previous_acceleration=previous_accelerations[i],
-#                    previous_optimal_sequence=previous_optimal_sequences[i],
-#                )
-#                acceleration_history[k, i] = acceleration
-#                mpc_diagnostics[k][i] = diagnostics
-#                previous_optimal_sequences[i] = optimal_sequence
-#            else:
-                # Normal HDV car-following acceleration
-                hdv_acceleration = HDVDynamics.calculate_acceleration(new_speeds[i], new_speeds[i - 1], gap_history[k, i])
-                # Additional pedestrian response
-                pedestrian_acceleration = calculate_hdv_pedestrian_acceleration(
-                    vehicle_position=new_positions[i],
-                    vehicle_speed=new_speeds[i],
-                    pedestrian_state=pedestrian_state_history[k],
-                    pedestrian_position=PEDESTRIAN_POSITION,
-                    leader_position=new_positions[i - 1],
-                )
-
-                if pedestrian_acceleration is not None:
-                    hdv_acceleration = min(hdv_acceleration, pedestrian_acceleration)
-                    pedestrian_acceleration_history[k, i] = pedestrian_acceleration
-
-                acceleration_history[k, i] = hdv_acceleration
-
+        pedestrian_state_history[k] = get_pedestrian_state(current_time)
+        acceleration_history[k], infeasible = _compute_accelerations(
+            new_positions, new_speeds, gap_history[k], current_time,
+            pedestrian_state_history[k], modes, pedestrian_acceleration_history[k]
+        )
+        mode_history[k] = modes
+        for i in infeasible:
+            infeasible_events.append((current_time, i, new_positions[i], new_speeds[i]))
 
         # =================================================
         # 5. Store state at k
         # =================================================
+        time_history[k] = k * DT
         position_history[k] = new_positions
         speed_history[k] = new_speeds
 
@@ -248,57 +196,10 @@ def simulate(df):
         "accelerations": acceleration_history,
         "gaps": gap_history,
         "vehicle_types": vehicle_types,
-        "mpc_diagnostics": mpc_diagnostics,
         "pedestrian_state": pedestrian_state_history,
+        "pedestrian_accelerations": pedestrian_acceleration_history,
         "pedestrian_position": PEDESTRIAN_POSITION,
-        "pedestrian_acceleration": pedestrian_acceleration_history,
+        "modes": mode_history,
+        "wall_hits": wall_hit_history,
+        "infeasible_events": infeasible_events,
     }
-
-
-def trace_av_failures(results, vehicle_index=10):
-    """Print the first few MPC failures for a selected AV."""
-    diagnostics_history = results["mpc_diagnostics"] 
-    positions = results["positions"]
-    speeds = results["speeds"]
-    accelerations = results["accelerations"]
-    gaps = results["gaps"]
-    vehicle_types = results["vehicle_types"]
-    time = results["time"]
-
-    print(f"\n=== MPC failure trace: vehicle {vehicle_index} ({vehicle_types[vehicle_index]}) ===")
-
-    failure_count = 0
-
-    for k, row in enumerate(diagnostics_history):
-        d = row[vehicle_index]
-
-        if d is None or d["success"]:
-            continue
-
-        print(f"\nFailure #{failure_count + 1} at t = {time[k]:.1f} s")
-        print(f"  current position       : {positions[k, vehicle_index]:.3f} m")
-        print(f"  current speed          : {speeds[k, vehicle_index]:.3f} m/s")
-        print(f"  current acceleration   : {accelerations[k, vehicle_index]:.3f} m/s²")
-        print(f"  current gap            : {gaps[k, vehicle_index]:.3f} m")
-        print(f"  objective              : {d['objective']:.6f}")
-        print(f"  status                 : {d['status']}")
-        print(f"  message                : {d['message']}")
-        print(f"  iterations             : {d['iterations']}")
-        print(f"  min speed margin       : {d['min_speed_margin']:.6f}")
-        print(f"  min gap margin         : {d['min_gap_margin']:.6f}")
-        print(f"  min constraint margin  : {d['min_constraint_margin']:.6f}")
-        print(f"  warm-start guess       : {np.asarray(d['initial_guess'])}")
-
-        if "fallback_acceleration" in d:
-            print(f"  fallback acceleration  : {d['fallback_acceleration']:.3f} m/s²")
-
-        failure_count += 1
-
-        if failure_count >= 5:
-            print("\n... failures more than 5, stopping ...")
-            break
-
-    if failure_count == 0:
-        print("No MPC failures found.")
-
-    return failure_count

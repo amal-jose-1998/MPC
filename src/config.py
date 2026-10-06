@@ -1,5 +1,5 @@
 # Simulation
-DT = 0.04                     # Simulation time step [s] (25 Hz simulation frequency)
+DT = 0.1                     # Simulation time step [s] (10 Hz simulation frequency)
 SIM_TIME = 60.0              # Total simulation time [s]
 
 # HDV model
@@ -47,7 +47,7 @@ AV_SPEED_MAX = 30.0       # m/s
 AV_DESIRED_SPEED = 20.0   # m/s
 
 # AV MPC
-MPC_HORIZON = 30      # Prediction horizon (3 seconds)
+MPC_HORIZON = 30      # Prediction horizon (3 seconds at 10 Hz)
 AV_HEADWAY_TARGET = 1.5       # Desired time headway [s]
 # MPC objective weights
 AV_SPEED_WEIGHT = 1.0 
