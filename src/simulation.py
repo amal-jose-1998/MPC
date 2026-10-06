@@ -44,6 +44,7 @@ def simulate(df):
     gap_history = np.full((n_steps, n_vehicles), np.nan)
 
     pedestrian_state_history = np.empty(n_steps, dtype=object)             # Pedestrian state at every simulation timestep.
+    pedestrian_acceleration_history = np.full((n_steps, n_vehicles), np.nan)
 
     # MPC diagnostics for every timestep and vehicle.
     mpc_diagnostics = [[None for _ in range(n_vehicles)] for _ in range(n_steps)]
@@ -88,20 +89,20 @@ def simulate(df):
 
     # Following vehicles
     for i in range(1, n_vehicles):
-        if vehicle_types[i] == "AV":
-            acceleration, optimal_sequence, diagnostics = compute_av_acceleration(
-                current_position=positions[i],
-                current_speed=speeds[i],
-                leader_position=positions[i - 1],
-                leader_speed=speeds[i - 1],
-                leader_acceleration=acceleration_history[0, i - 1],
-                previous_acceleration=0.0,
-                previous_optimal_sequence=None,
-            )
-            acceleration_history[0, i] = acceleration
-            previous_optimal_sequences[i] = optimal_sequence
-            mpc_diagnostics[0][i] = diagnostics
-        else:
+#        if vehicle_types[i] == "AV":
+#            acceleration, optimal_sequence, diagnostics = compute_av_acceleration(
+#                current_position=positions[i],
+#                current_speed=speeds[i],
+#                leader_position=positions[i - 1],
+#                leader_speed=speeds[i - 1],
+#                leader_acceleration=acceleration_history[0, i - 1],
+#                previous_acceleration=0.0,
+#                previous_optimal_sequence=None,
+#            )
+#            acceleration_history[0, i] = acceleration
+#            previous_optimal_sequences[i] = optimal_sequence
+#            mpc_diagnostics[0][i] = diagnostics
+#        else:
             # Normal HDV car-following acceleration
             hdv_acceleration = HDVDynamics.calculate_acceleration(speeds[i], speeds[i - 1], gap_history[0, i])
             # Pedestrian response for a following HDV. The pedestrian must be between this HDV and its leader. 
@@ -136,10 +137,10 @@ def simulate(df):
         # 1. State propagation: speed.  (v(k) = v(k-1) + a(k-1) * DT)
         # =================================================
         for i in range(n_vehicles):
-            if vehicle_types[i] == "AV":
-                # Pure AV dynamics: execute the acceleration selected by MPC.
-                new_speeds[i] = VehicleDynamics.update_velocity(previous_speeds[i], previous_accelerations[i])
-            else:
+#            if vehicle_types[i] == "AV":
+#                # Pure AV dynamics: execute the acceleration selected by MPC.
+#                new_speeds[i] = VehicleDynamics.update_velocity(previous_speeds[i], previous_accelerations[i])
+#            else:
                 new_speeds[i] = HDVDynamics.update_velocity(previous_speeds[i], previous_accelerations[i])
 
         # =================================================
@@ -202,20 +203,20 @@ def simulate(df):
 
         # Following vehicles
         for i in range(1, n_vehicles):
-            if vehicle_types[i] == "AV":
-                acceleration, optimal_sequence, diagnostics = compute_av_acceleration(
-                    current_position=new_positions[i],
-                    current_speed=new_speeds[i],
-                    leader_position=new_positions[i - 1],
-                    leader_speed=new_speeds[i - 1],
-                    leader_acceleration=acceleration_history[k, i - 1],
-                    previous_acceleration=previous_accelerations[i],
-                    previous_optimal_sequence=previous_optimal_sequences[i],
-                )
-                acceleration_history[k, i] = acceleration
-                mpc_diagnostics[k][i] = diagnostics
-                previous_optimal_sequences[i] = optimal_sequence
-            else:
+#            if vehicle_types[i] == "AV":
+#                acceleration, optimal_sequence, diagnostics = compute_av_acceleration(
+#                    current_position=new_positions[i],
+#                    current_speed=new_speeds[i],
+#                    leader_position=new_positions[i - 1],
+#                    leader_speed=new_speeds[i - 1],
+#                    leader_acceleration=acceleration_history[k, i - 1],
+#                    previous_acceleration=previous_accelerations[i],
+#                    previous_optimal_sequence=previous_optimal_sequences[i],
+#                )
+#                acceleration_history[k, i] = acceleration
+#                mpc_diagnostics[k][i] = diagnostics
+#                previous_optimal_sequences[i] = optimal_sequence
+#            else:
                 # Normal HDV car-following acceleration
                 hdv_acceleration = HDVDynamics.calculate_acceleration(new_speeds[i], new_speeds[i - 1], gap_history[k, i])
                 # Additional pedestrian response

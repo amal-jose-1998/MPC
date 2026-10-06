@@ -1,5 +1,5 @@
 # Simulation
-DT = 0.1                     # Simulation time step [s] (10 Hz simulation frequency)
+DT = 0.04                     # Simulation time step [s] (25 Hz simulation frequency)
 SIM_TIME = 60.0              # Total simulation time [s]
 
 # HDV model
@@ -7,8 +7,8 @@ ALPHA = 0.5                  # Speed adaptation parameter
 BETA = 0.2                   # Gap adaptation parameter
 DESIRED_GAP = 10.0           # [m]
 # Assumptions
-HDV_ACCEL_MIN = -3.0           # [m/s^2]
-HDV_ACCEL_MAX = 2.0            # [m/s^2]
+HDV_ACCEL_MIN = -10.0           # [m/s^2]
+HDV_ACCEL_MAX = 3.0            # [m/s^2]
 HDV_SPEED_MAX = 30.0           # [m/s]
 MIN_GAP = 2.0                  # Minimum bumper-to-bumper gap [m]
 
@@ -21,13 +21,16 @@ VEHICLE_LENGTH = 4.5         # Assumed common vehicle length [m]
 PEDESTRIAN_TIME = 20.0       # Time at which the pedestrian appears [s]
 PEDESTRIAN_POSITION = 400.0  # [m]
 PEDESTRIAN_DURATION = 10.0   # [s]
-PEDESTRIAN_WARNING_DURATION = 2.0   # Warning before pedestrian becomes active [s]
+PEDESTRIAN_WARNING_DURATION = 3.0   # Warning before pedestrian becomes active [s]
 
 # HDV pedestrian response
-PEDESTRIAN_HDV_WARNING_BRAKE = -1.0    # [m/s²]
-PEDESTRIAN_HDV_ACTIVE_BRAKE = -2.0     # [m/s²]  it is assumed that the HDV can brake harder when the pedestrian is actually present than when it is only a warning.
-PEDESTRIAN_HDV_REACTION_TIME = 1.5     # [s] Driver reaction time is the time it takes for the driver to react to the pedestrian warning and start braking.
+PEDESTRIAN_HDV_WARNING_BRAKE = -2.0    # [m/s²]
+PEDESTRIAN_HDV_ACTIVE_BRAKE = -10.0     # [m/s²]  it is assumed that the HDV can brake harder when the pedestrian is actually present than when it is only a warning.
+PEDESTRIAN_HDV_REACTION_TIME = 0     # [s] Driver reaction time is the time it takes for the driver to react to the pedestrian warning and start braking.
 PEDESTRIAN_HDV_SAFE_DISTANCE = 5.0     # [m] Extra distance maintained before crossing
+PEDESTRIAN_HDV_COMFORT_BRAKE = 2.0     # [m/s^2] A driver starts braking once the required deceleration reaches this value
+PEDESTRIAN_QUEUE_STANDSTILL_GAP = 3.0  # [m] Bumper-to-bumper gap between stopped vehicles in the queue at the crossing
+PEDESTRIAN_REQUIRE_FULL_CLEARANCE = True  
 
 # Visualization
 WINDOW_MARGIN = 50.0     # Margin around traffic for plots [m]
