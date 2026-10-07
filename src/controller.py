@@ -1,4 +1,11 @@
-"""MPC controller for autonomous vehicles in the mixed-traffic simulation."""
+"""
+MPC controller for autonomous vehicles in the mixed-traffic simulation.
+- during the warning period, check whether the feasible MPC trajectory can
+  clear the pedestrian crossing before the pedestrian arrives;
+- if it cannot, switch to a stopping trajectory;
+- while the pedestrian is active, keep the AV at or before the safe stop
+  position until the pedestrian leaves.
+"""
 
 import numpy as np
 from scipy.optimize import minimize
@@ -18,8 +25,12 @@ from .config import (
     AV_HEADWAY_TARGET,
     AV_HEADWAY_WEIGHT,
     AV_EPSILON,
-    HDV_SPEED_MAX
+    HDV_SPEED_MAX,
+    PEDESTRIAN_TIME,
+    PEDESTRIAN_POSITION,
+    PEDESTRIAN_REQUIRE_FULL_CLEARANCE,
 )
+from .pedestrian import get_pedestrian_state, X_STOP, T_PEDESTRIAN_END
 
 
 @lru_cache(maxsize=1)
@@ -101,14 +112,55 @@ def _predict_leader(current_position, current_speed, current_acceleration, horiz
     # x[k+1] = x[k] + v[k] * DT.
     positions = (
         current_position
-        + DT * np.cumsum(
+        + DT 
+        * np.cumsum(
             np.concatenate(
-                ([current_speed], speeds[:-1])
-            )
+                ([current_speed], speeds[:-1]))
         )
     )
 
     return positions, speeds
+
+
+# ============================================================
+# Pedestrian geometry
+# ============================================================
+def _pedestrian_clearance_position():
+    """Position required for the AV to have cleared the crossing."""
+    if PEDESTRIAN_REQUIRE_FULL_CLEARANCE:
+        return PEDESTRIAN_POSITION + VEHICLE_LENGTH
+    return PEDESTRIAN_POSITION
+
+def _crossing_index(current_time, horizon):
+    """Index corresponding to pedestrian arrival, if it lies in the horizon."""
+
+    time_to_pedestrian = PEDESTRIAN_TIME - current_time
+    if time_to_pedestrian <= 0.0:
+        return None
+
+    steps = int(np.ceil(time_to_pedestrian / DT - 1e-10))
+    if steps < 1 or steps > horizon:
+        return None
+
+    return steps - 1
+
+def _pedestrian_constraint_indices(current_time, horizon):
+    """Return prediction indices that must stay before X_STOP."""
+    state = get_pedestrian_state(current_time)
+
+    if state == "warning":
+        crossing_idx = _crossing_index(current_time, horizon)
+        if crossing_idx is None:
+            return np.empty(0, dtype=int)
+        # In warning mode, the stop constraint is used only by the STOP MPC and is imposed at pedestrian arrival.
+        return np.array([crossing_idx], dtype=int)
+
+    if state != "active":
+        return np.empty(0, dtype=int)
+
+    future_times = current_time + DT * np.arange(1, horizon + 1)
+    indices = np.flatnonzero(future_times <= T_PEDESTRIAN_END + 1e-9)
+    return indices.astype(int)
 
 # ============================================================
 # Objective and analytic Jacobian
@@ -160,7 +212,6 @@ def _objective_with_jacobian(acceleration_sequence, current_position, current_sp
     # d(positive_speed)/da = J_V where speed > epsilon,
     #                                  0 otherwise.
     d_headway = np.empty((a.size, a.size), dtype=float)
-
     positive_mask = av_speeds > AV_EPSILON
 
     if np.any(positive_mask):
@@ -194,82 +245,56 @@ def _objective_with_jacobian(acceleration_sequence, current_position, current_sp
 # ============================================================
 # Constraint values and analytic Jacobian
 # ============================================================
-def _constraint_values(acceleration_sequence, current_position, current_speed, leader_positions):
+def _constraint_values(acceleration_sequence, current_position, current_speed, leader_positions, current_time, pedestrian_stop=False,):
     """Return speed and minimum-gap constraint margins."""
     av_positions, av_speeds = _predict_av(current_position, current_speed, acceleration_sequence)
-
     speed_margins = np.concatenate((av_speeds, AV_SPEED_MAX - av_speeds))
 
     gaps = leader_positions - av_positions - VEHICLE_LENGTH
     gap_margins = gaps - MIN_GAP
 
-    return np.concatenate((speed_margins, gap_margins))
+    margins = [speed_margins, gap_margins]
+
+    if pedestrian_stop:
+        indices = _pedestrian_constraint_indices(current_time, acceleration_sequence.size)
+
+        if indices.size:
+            # Hard pedestrian safety condition: x_pred <= X_STOP
+            pedestrian_margin = X_STOP - av_positions[indices]
+            margins.append(pedestrian_margin)
+
+    return np.concatenate(margins)
 
 
-def _constraint_jacobian():
-    """Return the analytic Jacobian of all SLSQP inequality margins.
+def _constraint_jacobian(current_time, pedestrian_stop=False):
+    """Return the analytic Jacobian of all SLSQP inequality margins."""
+    rows = [
+        J_V,
+        -J_V,
+        -J_X,
+    ]
+    if pedestrian_stop:
+        indices = _pedestrian_constraint_indices(current_time, MPC_HORIZON)
+        if indices.size:
+            rows.append(-J_X[indices])
 
-    Constraint order is exactly the same as _constraint_values:
-        [v,
-         AV_SPEED_MAX-v,
-         gap-MIN_GAP]
-
-    Because leader predictions are independent of the AV decision variables,
-    d(gap)/da = -J_X.
-    """
-    return np.vstack(
-        (
-            J_V,
-            -J_V,
-            -J_X,
-        )
-    )
+    return np.vstack(rows)
 
 
-CONSTRAINT_JAC = _constraint_jacobian()
+# Default Jacobian for the normal MPC.
+CONSTRAINT_JAC = _constraint_jacobian(current_time=0.0, pedestrian_stop=False)
 
 
 # ============================================================
-# Public MPC controller
+# One MPC solve
 # ============================================================
-def compute_av_acceleration(
-    current_position,
-    current_speed,
-    leader_position,
-    leader_speed,
-    leader_acceleration,
-    previous_acceleration=0.0,
-    previous_optimal_sequence=None,
-):
-    """Compute the AV acceleration using receding-horizon MPC.
-    A warm start is used after the first call. Only the first acceleration of
-    the optimized sequence is applied by the simulator.
-    """
+def _solve_mpc(current_position, current_speed, leader_position, leader_speed, leader_acceleration,
+    previous_acceleration, initial_guess, current_time, speed_reference, pedestrian_stop=False):
+    """Solve one MPC problem."""
     horizon = MPC_HORIZON
 
-    if previous_optimal_sequence is not None:
-        previous_optimal_sequence = np.asarray(previous_optimal_sequence, dtype=float)
+    leader_positions, _ = _predict_leader(leader_position, leader_speed, leader_acceleration, horizon)
 
-        if previous_optimal_sequence.shape == (horizon,):
-            initial_guess = np.concatenate((previous_optimal_sequence[1:], [previous_optimal_sequence[-1]]))
-        else:
-            initial_guess = np.full(horizon, previous_acceleration, dtype=float)
-    else:
-        initial_guess = np.full(horizon, previous_acceleration, dtype=float)
-
-    initial_guess = np.clip(initial_guess, AV_ACCEL_MIN, AV_ACCEL_MAX)
-
-    # Leader prediction is fixed during this MPC solve, so compute it once.
-    leader_positions, leader_speeds = _predict_leader(leader_position, leader_speed, leader_acceleration, horizon)
-
-    del leader_speeds  # retained only for clarity; objective/constraints use positions.
-
-    # --------------------------------------------------------
-    # Evaluation cache
-    # --------------------------------------------------------
-    # SLSQP may ask for objective, Jacobian, constraints and constraint
-    # Jacobian at the same point. Keep one cached evaluation to avoid running
-    # the trajectory rollout more than necessary.
     cache = {
         "x": None,
         "objective": None,
@@ -293,6 +318,7 @@ def compute_av_acceleration(
                 current_speed,
                 previous_acceleration,
                 leader_positions,
+                speed_reference,
             )
             cache["x"] = x.copy()
             cache["objective"] = value
@@ -305,6 +331,7 @@ def compute_av_acceleration(
                 current_speed,
                 previous_acceleration,
                 leader_positions,
+                speed_reference,
             )
             cache["objective"] = value
             cache["objective_gradient"] = gradient
@@ -327,6 +354,8 @@ def compute_av_acceleration(
                 current_position,
                 current_speed,
                 leader_positions,
+                current_time,
+                pedestrian_stop,
             )
         elif cache["constraints"] is None:
             cache["constraints"] = _constraint_values(
@@ -334,18 +363,19 @@ def compute_av_acceleration(
                 current_position,
                 current_speed,
                 leader_positions,
+                current_time,
+                pedestrian_stop,
             )
 
         return cache["constraints"]
 
     def _evaluate_constraint_jacobian(x):
-        # The Jacobian is constant for this model, because both speed and
-        # position depend affinely on the acceleration sequence.
-        return CONSTRAINT_JAC
+        # Horizon and pedestrian phase are fixed during this solve.
+        return _constraint_jacobian(
+            current_time=current_time,
+            pedestrian_stop=pedestrian_stop,
+        )
 
-    # --------------------------------------------------------
-    # SLSQP optimization
-    # --------------------------------------------------------
     result = minimize(
         _evaluate_objective,
         initial_guess,
@@ -364,13 +394,10 @@ def compute_av_acceleration(
         },
     )
 
-    # --------------------------------------------------------
-    # Diagnostics
-    # --------------------------------------------------------
     candidate = (
         np.asarray(result.x, dtype=float)
         if hasattr(result, "x")
-        else initial_guess
+        else np.asarray(initial_guess, dtype=float)
     )
 
     constraint_values = _constraint_values(
@@ -378,37 +405,204 @@ def compute_av_acceleration(
         current_position,
         current_speed,
         leader_positions,
+        current_time,
+        pedestrian_stop,
     )
 
-    speed_margins = constraint_values[: 2 * horizon]
-    gap_margins = constraint_values[2 * horizon:]
+    return result, candidate, constraint_values, leader_positions
 
+# ============================================================
+# Public MPC controller
+# ============================================================
+def compute_av_acceleration(current_position, current_speed, leader_position, leader_speed, leader_acceleration, previous_acceleration=0.0,
+    previous_optimal_sequence=None, current_time=0.0,):
+    """Compute the AV acceleration using receding-horizon MPC.
+    
+    Pedestrian decision logic:
+        1. Before warning: normal MPC.
+        2. During warning: solve normal MPC first.
+           - If its feasible trajectory reaches the clearance position by
+             pedestrian arrival, continue with that trajectory.
+           - Otherwise, solve a stopping MPC with x(t_p) <= X_STOP.
+        3. During pedestrian activity: use stopping MPC with a hard
+           x <= X_STOP constraint until the pedestrian leaves.
+        4. After pedestrian clearance: return to normal MPC.
+
+    Only the first acceleration of the chosen optimal sequence is applied.
+    """
+    horizon = MPC_HORIZON
+
+    # --------------------------------------------------------
+    # Warm start
+    # --------------------------------------------------------
+    if previous_optimal_sequence is not None:
+        previous_optimal_sequence = np.asarray(previous_optimal_sequence, dtype=float)
+
+        if previous_optimal_sequence.shape == (horizon,):
+            initial_guess = np.concatenate((previous_optimal_sequence[1:], [previous_optimal_sequence[-1]]))
+        else:
+            initial_guess = np.full(horizon, previous_acceleration, dtype=float)
+    else:
+        initial_guess = np.full(horizon, previous_acceleration, dtype=float)
+
+    initial_guess = np.clip(initial_guess, AV_ACCEL_MIN, AV_ACCEL_MAX)
+
+    state = get_pedestrian_state(current_time)
     diagnostics = {
-        "success": bool(result.success),
-        "status": int(result.status),
-        "message": str(result.message),
-        "objective": (
-            float(result.fun)
-            if np.isfinite(result.fun)
-            else np.inf
-        ),
-        "min_constraint_margin": float(np.min(constraint_values)),
-        "min_speed_margin": float(np.min(speed_margins)),
-        "min_gap_margin": float(np.min(gap_margins)),
-        "iterations": int(getattr(result, "nit", -1)),
+        "success": False,
+        "status": -1,
+        "message": "",
+        "objective": np.inf,
+        "min_constraint_margin": np.inf,
+        "min_speed_margin": np.inf,
+        "min_gap_margin": np.inf,
+        "iterations": -1,
         "initial_guess": initial_guess.copy(),
         "optimal_sequence": None,
+        "pedestrian_state": state,
+        "pedestrian_mode": "normal",
+        "pedestrian_clearance_possible": None,
+        "pedestrian_clearance_position": _pedestrian_clearance_position(),
+        "pedestrian_stop_position": X_STOP,
+        "predicted_position_at_pedestrian_time": None,
+        "stop_mpc_success": None,
     }
 
     # --------------------------------------------------------
-    # Safe fallback
+    # 1. Normal MPC solve.
     # --------------------------------------------------------
-    if not result.success:
-        fallback_acceleration = float(np.clip(previous_acceleration, AV_ACCEL_MIN, AV_ACCEL_MAX))
-        diagnostics["fallback_acceleration"] = fallback_acceleration
-        return fallback_acceleration, initial_guess, diagnostics
+    normal_result, normal_candidate, normal_constraints, leader_positions = _solve_mpc(
+        current_position=current_position,
+        current_speed=current_speed,
+        leader_position=leader_position,
+        leader_speed=leader_speed,
+        leader_acceleration=leader_acceleration,
+        previous_acceleration=previous_acceleration,
+        initial_guess=initial_guess,
+        current_time=current_time,
+        speed_reference=AV_DESIRED_SPEED,
+        pedestrian_stop=False,
+    )
 
-    optimal_sequence = np.clip(candidate, AV_ACCEL_MIN, AV_ACCEL_MAX)
+    normal_feasible = bool(normal_result.success and np.all(normal_constraints >= -1e-6))
+
+    chosen_result = normal_result
+    chosen_candidate = normal_candidate
+    chosen_constraints = normal_constraints
+    chosen_mode = "normal"
+
+    # --------------------------------------------------------
+    # 2. Warning: use predicted position at pedestrian arrival to decide CLEAR vs STOP.
+    # --------------------------------------------------------
+    if state == "warning":
+        crossing_idx = _crossing_index(current_time, horizon)
+
+        if crossing_idx is not None and normal_feasible: # Only check clearance if the normal MPC is feasible and the pedestrian arrival is within the horizon.
+            predicted_at_pedestrian = _predict_av(current_position, current_speed, normal_candidate)[0][crossing_idx] # Predicted position at pedestrian arrival.
+            diagnostics["predicted_position_at_pedestrian_time"] = float(predicted_at_pedestrian)
+
+            clearance_target = _pedestrian_clearance_position()
+            clearance_possible = (predicted_at_pedestrian >= clearance_target - 1e-6)
+            diagnostics["pedestrian_clearance_possible"] = bool(clearance_possible)
+        else: # If the normal MPC is infeasible or the pedestrian arrival is outside the horizon, we cannot guarantee clearance.
+            clearance_possible = False
+            diagnostics["pedestrian_clearance_possible"] = False
+
+        if clearance_possible:
+            chosen_mode = "committed"
+        else:
+            # If the normal MPC cannot guarantee clearance, we attempt a stopping MPC with a hard x <= X_STOP constraint.
+            stop_guess = normal_candidate if normal_feasible else initial_guess
+
+            stop_result, stop_candidate, stop_constraints, _ = _solve_mpc(
+                current_position=current_position,
+                current_speed=current_speed,
+                leader_position=leader_position,
+                leader_speed=leader_speed,
+                leader_acceleration=leader_acceleration,
+                previous_acceleration=previous_acceleration,
+                initial_guess=stop_guess,
+                current_time=current_time,
+                speed_reference=0.0,
+                pedestrian_stop=True,
+            )
+
+            stop_feasible = bool(stop_result.success and np.all(stop_constraints >= -1e-6))
+            diagnostics["stop_mpc_success"] = stop_feasible
+
+            if stop_feasible:
+                chosen_result = stop_result
+                chosen_candidate = stop_candidate
+                chosen_constraints = stop_constraints
+                chosen_mode = "stopping"
+            else:
+                # A true dilemma/infeasible situation: neither a normal crossing trajectory nor a safe stopping trajectory is feasible.
+                chosen_mode = "dilemma"
+
+    # --------------------------------------------------------
+    # 3. Active pedestrian: enforce x <= X_STOP during the active interval.
+    # --------------------------------------------------------
+    elif state == "active":
+        active_guess = normal_candidate if normal_feasible else initial_guess
+
+        stop_result, stop_candidate, stop_constraints, _ = _solve_mpc(
+            current_position=current_position,
+            current_speed=current_speed,
+            leader_position=leader_position,
+            leader_speed=leader_speed,
+            leader_acceleration=leader_acceleration,
+            previous_acceleration=previous_acceleration,
+            initial_guess=active_guess,
+            current_time=current_time,
+            speed_reference=0.0,
+            pedestrian_stop=True,
+        )
+
+        stop_feasible = bool(stop_result.success and np.all(stop_constraints >= -1e-6))
+        diagnostics["stop_mpc_success"] = stop_feasible
+
+        if stop_feasible:
+            chosen_result = stop_result
+            chosen_candidate = stop_candidate
+            chosen_constraints = stop_constraints
+            chosen_mode = "stopping"
+        else:
+            chosen_mode = "dilemma"
+
+    # --------------------------------------------------------
+    # Diagnostics for chosen solution.
+    # --------------------------------------------------------
+    diagnostics["success"] = bool(chosen_result.success and np.all(chosen_constraints >= -1e-6))
+    diagnostics["status"] = int(chosen_result.status)
+    diagnostics["message"] = str(chosen_result.message)
+    diagnostics["objective"] = (float(chosen_result.fun) if np.isfinite(chosen_result.fun) else np.inf)
+
+    speed_margins = chosen_constraints[: 2 * horizon]
+    gap_margins = chosen_constraints[2 * horizon:]
+
+    diagnostics["min_constraint_margin"] = float(np.min(chosen_constraints))
+    diagnostics["min_speed_margin"] = float(np.min(speed_margins))
+
+    # The first horizon entries after speed margins are the gap constraints.
+    diagnostics["min_gap_margin"] = float(np.min(gap_margins[:horizon]))
+    diagnostics["iterations"] = int(getattr(chosen_result, "nit", -1))
+    diagnostics["pedestrian_mode"] = chosen_mode
+
+    # --------------------------------------------------------
+    # Safe fallback.
+    # --------------------------------------------------------
+    if not diagnostics["success"]:
+        if chosen_mode == "dilemma":
+            # Use the strongest available AV braking as the emergency action.
+            fallback_acceleration = AV_ACCEL_MIN
+        else:
+            fallback_acceleration = float(np.clip(previous_acceleration, AV_ACCEL_MIN, AV_ACCEL_MAX))
+
+        diagnostics["fallback_acceleration"] = fallback_acceleration
+        diagnostics["optimal_sequence"] = initial_guess.copy()
+        return (fallback_acceleration, initial_guess, diagnostics)
+
+    optimal_sequence = np.clip(chosen_candidate, AV_ACCEL_MIN, AV_ACCEL_MAX,)
     diagnostics["optimal_sequence"] = optimal_sequence.copy()
 
-    return float(optimal_sequence[0]), optimal_sequence, diagnostics
+    return (float(optimal_sequence[0]), optimal_sequence, diagnostics)

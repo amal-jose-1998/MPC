@@ -41,8 +41,8 @@ LEADER_DESIRED_SPEED = 20.0  # m/s
 LEADER_ALPHA = 0.5                # Speed adaptation
 
 # AV physical limits
-AV_ACCEL_MIN = -3.0       # m/s²
-AV_ACCEL_MAX = 2.0        # m/s²
+AV_ACCEL_MIN = -10.0       # m/s²
+AV_ACCEL_MAX = 3.0        # m/s²
 AV_SPEED_MAX = 30.0       # m/s
 AV_DESIRED_SPEED = 20.0   # m/s
 
