@@ -29,6 +29,8 @@ from .config import (
     PEDESTRIAN_TIME,
     PEDESTRIAN_POSITION,
     PEDESTRIAN_REQUIRE_FULL_CLEARANCE,
+    AV_STOP_POSITION_WEIGHT,
+    PEDESTRIAN_QUEUE_STANDSTILL_GAP,
 )
 from .pedestrian import get_pedestrian_state, X_STOP, T_PEDESTRIAN_END
 
@@ -165,7 +167,8 @@ def _pedestrian_constraint_indices(current_time, horizon):
 # ============================================================
 # Objective and analytic Jacobian
 # ============================================================
-def _objective_with_jacobian(acceleration_sequence, current_position, current_speed, previous_acceleration, leader_positions):
+def _objective_with_jacobian(acceleration_sequence, current_position, current_speed, previous_acceleration, 
+                             leader_positions, speed_reference, stop_target_positions=None):
     """Return MPC objective and its analytic gradient."""
     a = np.asarray(acceleration_sequence, dtype=float)
     av_positions, av_speeds = _predict_av(current_position, current_speed, a)
@@ -173,7 +176,7 @@ def _objective_with_jacobian(acceleration_sequence, current_position, current_sp
     # --------------------------------------------------------
     # 1. Desired-speed tracking
     # --------------------------------------------------------
-    speed_error = av_speeds - AV_DESIRED_SPEED
+    speed_error = av_speeds - speed_reference
     speed_cost = AV_SPEED_WEIGHT * np.sum(speed_error ** 2)
     grad_speed = 2.0 * AV_SPEED_WEIGHT * (J_V.T @ speed_error)
 
@@ -237,8 +240,22 @@ def _objective_with_jacobian(acceleration_sequence, current_position, current_sp
     else:
         grad_headway = np.zeros_like(a)
 
-    objective = speed_cost + jerk_cost + safety_cost
-    gradient = grad_speed + grad_jerk + grad_headway
+    # ========================================================
+    # 4. stopping-position objective
+    # ========================================================
+    stop_position_cost = 0.0
+    grad_stop_position = (np.zeros_like(a))
+
+    if stop_target_positions is not None:
+        position_error = av_positions - stop_target_positions
+        stop_position_cost = AV_STOP_POSITION_WEIGHT  * np.sum(position_error ** 2)
+        grad_stop_position = 2.0 * AV_STOP_POSITION_WEIGHT * (J_X.T @ position_error)
+
+    # ========================================================
+    # Total objective
+    # ========================================================
+    objective = speed_cost + jerk_cost + safety_cost + stop_position_cost
+    gradient = grad_speed + grad_jerk + grad_headway + grad_stop_position
 
     return float(objective), gradient
 
@@ -289,11 +306,21 @@ CONSTRAINT_JAC = _constraint_jacobian(current_time=0.0, pedestrian_stop=False)
 # One MPC solve
 # ============================================================
 def _solve_mpc(current_position, current_speed, leader_position, leader_speed, leader_acceleration,
-    previous_acceleration, initial_guess, current_time, speed_reference, pedestrian_stop=False):
+    previous_acceleration, initial_guess, current_time, speed_reference, pedestrian_stop=False, leader_is_stopping=False):
     """Solve one MPC problem."""
     horizon = MPC_HORIZON
 
     leader_positions, _ = _predict_leader(leader_position, leader_speed, leader_acceleration, horizon)
+
+    stop_target_positions = None
+    if pedestrian_stop:
+        if leader_is_stopping:
+            stop_target = leader_positions - VEHICLE_LENGTH - PEDESTRIAN_QUEUE_STANDSTILL_GAP
+        else:
+            stop_target = X_STOP
+
+        # Keep one fixed stopping target over the whole MPC horizon.
+        stop_target_positions = np.full(horizon, stop_target, dtype=float)
 
     cache = {
         "x": None,
@@ -319,6 +346,7 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
                 previous_acceleration,
                 leader_positions,
                 speed_reference,
+                stop_target_positions,
             )
             cache["x"] = x.copy()
             cache["objective"] = value
@@ -332,6 +360,7 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
                 previous_acceleration,
                 leader_positions,
                 speed_reference,
+                stop_target_positions,
             )
             cache["objective"] = value
             cache["objective_gradient"] = gradient
@@ -415,7 +444,7 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
 # Public MPC controller
 # ============================================================
 def compute_av_acceleration(current_position, current_speed, leader_position, leader_speed, leader_acceleration, previous_acceleration=0.0,
-    previous_optimal_sequence=None, current_time=0.0,):
+    previous_optimal_sequence=None, current_time=0.0, leader_is_stopping=False,):
     """Compute the AV acceleration using receding-horizon MPC.
     
     Pedestrian decision logic:
@@ -482,6 +511,7 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
         current_time=current_time,
         speed_reference=AV_DESIRED_SPEED,
         pedestrian_stop=False,
+        leader_is_stopping=leader_is_stopping,
     )
 
     normal_feasible = bool(normal_result.success and np.all(normal_constraints >= -1e-6))
@@ -525,6 +555,7 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
                 current_time=current_time,
                 speed_reference=0.0,
                 pedestrian_stop=True,
+                leader_is_stopping=leader_is_stopping
             )
 
             stop_feasible = bool(stop_result.success and np.all(stop_constraints >= -1e-6))
@@ -542,7 +573,7 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
     # --------------------------------------------------------
     # 3. Active pedestrian: enforce x <= X_STOP during the active interval.
     # --------------------------------------------------------
-    elif state == "active":
+    elif state == "active" and current_position < PEDESTRIAN_POSITION:
         active_guess = normal_candidate if normal_feasible else initial_guess
 
         stop_result, stop_candidate, stop_constraints, _ = _solve_mpc(
@@ -556,6 +587,7 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
             current_time=current_time,
             speed_reference=0.0,
             pedestrian_stop=True,
+            leader_is_stopping=leader_is_stopping
         )
 
         stop_feasible = bool(stop_result.success and np.all(stop_constraints >= -1e-6))
