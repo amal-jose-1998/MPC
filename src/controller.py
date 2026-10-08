@@ -263,7 +263,7 @@ def _objective_with_jacobian(acceleration_sequence, current_position, current_sp
 # Constraint values and analytic Jacobian
 # ============================================================
 def _constraint_values(acceleration_sequence, current_position, current_speed, leader_positions, current_time, pedestrian_stop=False,):
-    """Return speed and minimum-gap constraint margins."""
+    """Return constraint margins."""
     av_positions, av_speeds = _predict_av(current_position, current_speed, acceleration_sequence)
     speed_margins = np.concatenate((av_speeds, AV_SPEED_MAX - av_speeds))
 
@@ -272,13 +272,16 @@ def _constraint_values(acceleration_sequence, current_position, current_speed, l
 
     margins = [speed_margins, gap_margins]
 
-    if pedestrian_stop:
+    if pedestrian_stop: 
         indices = _pedestrian_constraint_indices(current_time, acceleration_sequence.size)
 
         if indices.size:
             # Hard pedestrian safety condition: x_pred <= X_STOP
             pedestrian_margin = X_STOP - av_positions[indices]
             margins.append(pedestrian_margin)
+            if get_pedestrian_state(current_time) == "warning":
+                stop_speed_margin = -av_speeds[indices]
+                margins.append(stop_speed_margin)
 
     return np.concatenate(margins)
 
@@ -294,6 +297,10 @@ def _constraint_jacobian(current_time, pedestrian_stop=False):
         indices = _pedestrian_constraint_indices(current_time, MPC_HORIZON)
         if indices.size:
             rows.append(-J_X[indices])
+            # During warning:
+            # v <= AV_STOP_SPEED_EPS
+            if get_pedestrian_state(current_time) == "warning":
+                rows.append(-J_V[indices])
 
     return np.vstack(rows)
 
@@ -301,12 +308,30 @@ def _constraint_jacobian(current_time, pedestrian_stop=False):
 # Default Jacobian for the normal MPC.
 CONSTRAINT_JAC = _constraint_jacobian(current_time=0.0, pedestrian_stop=False)
 
+def _can_physically_stop(current_position, current_speed, stop_target):
+    """
+    Check whether the AV can physically stop at or before the target
+    using its maximum available braking.
+    """
+    if current_speed <= AV_EPSILON:
+        return current_position <= stop_target + 1e-6
+
+    braking = abs(AV_ACCEL_MIN)
+
+    stopping_distance = (
+        current_speed ** 2
+        / (2.0 * braking)
+    )
+
+    stopping_position = current_position + stopping_distance
+
+    return stopping_position <= stop_target + 1e-6
 
 # ============================================================
 # One MPC solve
 # ============================================================
 def _solve_mpc(current_position, current_speed, leader_position, leader_speed, leader_acceleration,
-    previous_acceleration, initial_guess, current_time, speed_reference, pedestrian_stop=False, leader_is_stopping=False):
+    previous_acceleration, initial_guess, current_time, speed_reference, pedestrian_stop=False):
     """Solve one MPC problem."""
     horizon = MPC_HORIZON
 
@@ -314,11 +339,8 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
 
     stop_target_positions = None
     if pedestrian_stop:
-        if leader_is_stopping:
-            stop_target = leader_positions - VEHICLE_LENGTH - PEDESTRIAN_QUEUE_STANDSTILL_GAP
-        else:
-            stop_target = X_STOP
-
+        queue_target = leader_position - VEHICLE_LENGTH - PEDESTRIAN_QUEUE_STANDSTILL_GAP
+        stop_target = min(queue_target, X_STOP)
         # Keep one fixed stopping target over the whole MPC horizon.
         stop_target_positions = np.full(horizon, stop_target, dtype=float)
 
@@ -443,8 +465,8 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
 # ============================================================
 # Public MPC controller
 # ============================================================
-def compute_av_acceleration(current_position, current_speed, leader_position, leader_speed, leader_acceleration, previous_acceleration=0.0,
-    previous_optimal_sequence=None, current_time=0.0, leader_is_stopping=False,):
+def compute_av_acceleration(current_position, current_speed, leader_position, leader_speed, leader_acceleration, previous_pedestrian_mode="normal",
+                            previous_acceleration=0.0, previous_optimal_sequence=None, current_time=0.0,):
     """Compute the AV acceleration using receding-horizon MPC.
     
     Pedestrian decision logic:
@@ -477,6 +499,8 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
     initial_guess = np.clip(initial_guess, AV_ACCEL_MIN, AV_ACCEL_MAX)
 
     state = get_pedestrian_state(current_time)
+    previous_mode_is_latched = (previous_pedestrian_mode == "stopping" and state in ("warning", "active"))
+    
     diagnostics = {
         "success": False,
         "status": -1,
@@ -511,7 +535,6 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
         current_time=current_time,
         speed_reference=AV_DESIRED_SPEED,
         pedestrian_stop=False,
-        leader_is_stopping=leader_is_stopping,
     )
 
     normal_feasible = bool(normal_result.success and np.all(normal_constraints >= -1e-6))
@@ -525,18 +548,23 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
     # 2. Warning: use predicted position at pedestrian arrival to decide CLEAR vs STOP.
     # --------------------------------------------------------
     if state == "warning":
-        crossing_idx = _crossing_index(current_time, horizon)
-
-        if crossing_idx is not None and normal_feasible: # Only check clearance if the normal MPC is feasible and the pedestrian arrival is within the horizon.
-            predicted_at_pedestrian = _predict_av(current_position, current_speed, normal_candidate)[0][crossing_idx] # Predicted position at pedestrian arrival.
-            diagnostics["predicted_position_at_pedestrian_time"] = float(predicted_at_pedestrian)
-
-            clearance_target = _pedestrian_clearance_position()
-            clearance_possible = (predicted_at_pedestrian >= clearance_target - 1e-6)
-            diagnostics["pedestrian_clearance_possible"] = bool(clearance_possible)
-        else: # If the normal MPC is infeasible or the pedestrian arrival is outside the horizon, we cannot guarantee clearance.
+        if previous_mode_is_latched:
             clearance_possible = False
             diagnostics["pedestrian_clearance_possible"] = False
+
+        else:
+            crossing_idx = _crossing_index(current_time, horizon)
+
+            if crossing_idx is not None and normal_feasible: # Only check clearance if the normal MPC is feasible and the pedestrian arrival is within the horizon.
+                predicted_at_pedestrian = _predict_av(current_position, current_speed, normal_candidate)[0][crossing_idx] # Predicted position at pedestrian arrival.
+                diagnostics["predicted_position_at_pedestrian_time"] = float(predicted_at_pedestrian)
+
+                clearance_target = _pedestrian_clearance_position()
+                clearance_possible = (predicted_at_pedestrian >= clearance_target - 1e-6)
+                diagnostics["pedestrian_clearance_possible"] = bool(clearance_possible)
+            else: # If the normal MPC is infeasible or the pedestrian arrival is outside the horizon, we cannot guarantee clearance.
+                clearance_possible = False
+                diagnostics["pedestrian_clearance_possible"] = False
 
         if clearance_possible:
             chosen_mode = "committed"
@@ -555,13 +583,22 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
                 current_time=current_time,
                 speed_reference=0.0,
                 pedestrian_stop=True,
-                leader_is_stopping=leader_is_stopping
             )
 
             stop_feasible = bool(stop_result.success and np.all(stop_constraints >= -1e-6))
             diagnostics["stop_mpc_success"] = stop_feasible
+            stop_target = min(leader_position - VEHICLE_LENGTH - PEDESTRIAN_QUEUE_STANDSTILL_GAP, X_STOP)
+            physically_can_stop = _can_physically_stop(current_position, current_speed, stop_target)
+            diagnostics["physically_can_stop"] = physically_can_stop
+            diagnostics["stop_target_position"] = float(stop_target)
 
             if stop_feasible:
+                chosen_result = stop_result
+                chosen_candidate = stop_candidate
+                chosen_constraints = stop_constraints
+                chosen_mode = "stopping"
+            elif physically_can_stop:
+                # A feasible stopping trajectory exists, but the MPC solver failed to find it.
                 chosen_result = stop_result
                 chosen_candidate = stop_candidate
                 chosen_constraints = stop_constraints
@@ -569,11 +606,14 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
             else:
                 # A true dilemma/infeasible situation: neither a normal crossing trajectory nor a safe stopping trajectory is feasible.
                 chosen_mode = "dilemma"
+                chosen_result = stop_result
+                chosen_candidate = stop_candidate
+                chosen_constraints = stop_constraints
 
     # --------------------------------------------------------
     # 3. Active pedestrian: enforce x <= X_STOP during the active interval.
     # --------------------------------------------------------
-    elif state == "active" and current_position < PEDESTRIAN_POSITION:
+    elif state == "active" and current_position < _pedestrian_clearance_position():
         active_guess = normal_candidate if normal_feasible else initial_guess
 
         stop_result, stop_candidate, stop_constraints, _ = _solve_mpc(
@@ -587,19 +627,16 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
             current_time=current_time,
             speed_reference=0.0,
             pedestrian_stop=True,
-            leader_is_stopping=leader_is_stopping
         )
 
         stop_feasible = bool(stop_result.success and np.all(stop_constraints >= -1e-6))
         diagnostics["stop_mpc_success"] = stop_feasible
 
-        if stop_feasible:
-            chosen_result = stop_result
-            chosen_candidate = stop_candidate
-            chosen_constraints = stop_constraints
-            chosen_mode = "stopping"
-        else:
-            chosen_mode = "dilemma"
+        chosen_result = stop_result
+        chosen_candidate = stop_candidate
+        chosen_constraints = stop_constraints
+        chosen_mode = "stopping"
+
 
     # --------------------------------------------------------
     # Diagnostics for chosen solution.
@@ -624,7 +661,7 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
     # Safe fallback.
     # --------------------------------------------------------
     if not diagnostics["success"]:
-        if chosen_mode == "dilemma":
+        if chosen_mode in ("stopping", "dilemma"):
             # Use the strongest available AV braking as the emergency action.
             fallback_acceleration = AV_ACCEL_MIN
         else:

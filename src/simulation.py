@@ -98,7 +98,7 @@ def _leader_stop_target(leader_index, vehicle_types, positions, modes, mpc_diagn
     return X_STOP
 
 
-def _compute_accelerations(positions, speeds, gaps, current_time, pedestrian_state, vehicle_types, modes, 
+def _compute_accelerations(positions, speeds, gaps, current_time, pedestrian_state, vehicle_types, modes, av_pedestrian_modes,
                            previous_accelerations, previous_optimal_sequences, pedestrian_acceleration_row, mpc_diagnostics_row,):
     """
     HDV:
@@ -131,22 +131,12 @@ def _compute_accelerations(positions, speeds, gaps, current_time, pedestrian_sta
                 previous_acceleration=previous_accelerations[i],
                 previous_optimal_sequence=previous_optimal_sequences.get(i),
                 current_time=current_time,
-                leader_is_stopping=(
-                    (
-                        vehicle_types[i - 1] == "AV"
-                        and mpc_diagnostics_row[i - 1] is not None
-                        and mpc_diagnostics_row[i - 1].get("pedestrian_mode")
-                        in ("stopping", "dilemma")
-                    )
-                    or (
-                        vehicle_types[i - 1] != "AV"
-                        and modes[i - 1] == MODE_STOPPING
-                    )
-                ),
+                previous_pedestrian_mode=av_pedestrian_modes[i],
             )
             accelerations[i] = acceleration
             previous_optimal_sequences[i] = optimal_sequence
             mpc_diagnostics_row[i] = diagnostics
+            av_pedestrian_modes[i] = diagnostics["pedestrian_mode"]
             continue
 
         else:
@@ -255,6 +245,9 @@ def simulate(df):
     ]
  
     modes = np.full(n_vehicles, MODE_FREE, dtype=int) # Current pedestrian mode state for HDVs.
+    # Persistent pedestrian mode state for AVs.
+    # Values: "normal", "committed", "stopping", "dilemma"
+    av_pedestrian_modes = {i: "normal" for i in range(n_vehicles) if vehicle_types[i] == "AV"}
 
     # =================================================
     # k = 0
@@ -277,6 +270,7 @@ def simulate(df):
         pedestrian_state=pedestrian_state_history[0],
         vehicle_types=vehicle_types,
         modes=modes,
+        av_pedestrian_modes=av_pedestrian_modes,
         previous_accelerations=np.zeros(n_vehicles, dtype=float),
         previous_optimal_sequences=previous_optimal_sequences,
         pedestrian_acceleration_row=pedestrian_acceleration_history[0],
@@ -356,6 +350,7 @@ def simulate(df):
             pedestrian_state=pedestrian_state,
             vehicle_types=vehicle_types,
             modes=modes,
+            av_pedestrian_modes=av_pedestrian_modes,
             previous_accelerations=previous_accelerations,
             previous_optimal_sequences=previous_optimal_sequences,
             pedestrian_acceleration_row=pedestrian_acceleration_history[k],
