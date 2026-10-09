@@ -30,6 +30,7 @@ from .config import (
     PEDESTRIAN_POSITION,
     PEDESTRIAN_REQUIRE_FULL_CLEARANCE,
     AV_STOP_POSITION_WEIGHT,
+    AV_SAFE_BRAKE,
     PEDESTRIAN_QUEUE_STANDSTILL_GAP,
 )
 from .pedestrian import get_pedestrian_state, X_STOP, T_PEDESTRIAN_END
@@ -262,7 +263,8 @@ def _objective_with_jacobian(acceleration_sequence, current_position, current_sp
 # ============================================================
 # Constraint values and analytic Jacobian
 # ============================================================
-def _constraint_values(acceleration_sequence, current_position, current_speed, leader_positions, current_time, pedestrian_stop=False,):
+def _constraint_values(acceleration_sequence, current_position, current_speed, leader_positions, 
+                       current_time, pedestrian_stop=False, stop_target=None,):
     """Return constraint margins."""
     av_positions, av_speeds = _predict_av(current_position, current_speed, acceleration_sequence)
     speed_margins = np.concatenate((av_speeds, AV_SPEED_MAX - av_speeds))
@@ -279,34 +281,103 @@ def _constraint_values(acceleration_sequence, current_position, current_speed, l
             # Hard pedestrian safety condition: x_pred <= X_STOP
             pedestrian_margin = X_STOP - av_positions[indices]
             margins.append(pedestrian_margin)
-            if get_pedestrian_state(current_time) == "warning":
-                stop_speed_margin = -av_speeds[indices]
-                margins.append(stop_speed_margin)
+            
+            #if get_pedestrian_state(current_time) == "warning":
+            #    stop_speed_margin = -av_speeds[indices]
+            #    margins.append(stop_speed_margin)
+            
+            if stop_target is not None:
+                stopping_envelope_margin = (
+                    2.0
+                    * AV_SAFE_BRAKE
+                    * (stop_target - av_positions[indices])
+                    - av_speeds[indices] ** 2
+                )
+                margins.append(stopping_envelope_margin)
+
 
     return np.concatenate(margins)
 
 
-def _constraint_jacobian(current_time, pedestrian_stop=False):
+def _constraint_jacobian(acceleration_sequence, current_position, current_speed, current_time, pedestrian_stop=False, stop_target=None,):
     """Return the analytic Jacobian of all SLSQP inequality margins."""
+    a = np.asarray(acceleration_sequence, dtype=float)
+
+    av_positions, av_speeds = _predict_av(current_position, current_speed, a)
+
+    # 1. Normal constraints
     rows = [
         J_V,
         -J_V,
         -J_X,
     ]
+
+    # 2. Pedestrian constraints
     if pedestrian_stop:
         indices = _pedestrian_constraint_indices(current_time, MPC_HORIZON)
         if indices.size:
-            rows.append(-J_X[indices])
+            rows.append(-J_X[indices]) # x <= X_STOP
             # During warning:
             # v <= AV_STOP_SPEED_EPS
-            if get_pedestrian_state(current_time) == "warning":
-                rows.append(-J_V[indices])
+            #if get_pedestrian_state(current_time) == "warning":
+            #    rows.append(-J_V[indices])
+
+            if stop_target is not None:
+                envelope_jacobian = (
+                    -2.0
+                    * AV_SAFE_BRAKE
+                    * J_X[indices]
+                    -2.0
+                    * av_speeds[indices, None]
+                    * J_V[indices]
+                )
+
+                rows.append(envelope_jacobian)
 
     return np.vstack(rows)
 
 
-# Default Jacobian for the normal MPC.
-CONSTRAINT_JAC = _constraint_jacobian(current_time=0.0, pedestrian_stop=False)
+def _fallback_stop_acceleration(current_position, current_speed, stop_target):
+    """
+    Calculate a braking acceleration that aims to stop the AV at the pedestrian stopping target.
+    This is used only when the MPC solver fails but a physical stopping trajectory still exists.
+    """
+    if current_speed <= AV_EPSILON:
+        return 0.0
+
+    # Predict position using the simulation's position update.
+    next_position = current_position + current_speed * DT
+
+    # Remaining distance after this step.
+    remaining_distance = stop_target - next_position
+
+    # The target has been reached or passed.
+    if remaining_distance <= 0.0:
+        return float(AV_ACCEL_MIN)
+
+    # Maximum speed allowed by the braking envelope
+    # at the next predicted position.
+    safe_next_speed = np.sqrt(
+        max(
+            0.0,
+            2.0 * AV_SAFE_BRAKE * remaining_distance,
+        )
+    )
+
+    # Acceleration needed to reach that speed in one step.
+    required_acceleration = (
+        safe_next_speed - current_speed
+    ) / DT
+
+    # Apply available braking, but never accelerate in fallback.
+    return float(
+        np.clip(
+            required_acceleration,
+            AV_ACCEL_MIN,
+            0.0,
+        )
+    )
+
 
 def _can_physically_stop(current_position, current_speed, stop_target):
     """
@@ -337,6 +408,7 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
 
     leader_positions, _ = _predict_leader(leader_position, leader_speed, leader_acceleration, horizon)
 
+    stop_target = None
     stop_target_positions = None
     if pedestrian_stop:
         queue_target = leader_position - VEHICLE_LENGTH - PEDESTRIAN_QUEUE_STANDSTILL_GAP
@@ -407,6 +479,7 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
                 leader_positions,
                 current_time,
                 pedestrian_stop,
+                stop_target,
             )
         elif cache["constraints"] is None:
             cache["constraints"] = _constraint_values(
@@ -416,6 +489,7 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
                 leader_positions,
                 current_time,
                 pedestrian_stop,
+                stop_target,
             )
 
         return cache["constraints"]
@@ -423,9 +497,13 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
     def _evaluate_constraint_jacobian(x):
         # Horizon and pedestrian phase are fixed during this solve.
         return _constraint_jacobian(
+            acceleration_sequence=x,
+            current_position=current_position,
+            current_speed=current_speed,
             current_time=current_time,
             pedestrian_stop=pedestrian_stop,
-        )
+            stop_target=stop_target,
+            )
 
     result = minimize(
         _evaluate_objective,
@@ -458,6 +536,7 @@ def _solve_mpc(current_position, current_speed, leader_position, leader_speed, l
         leader_positions,
         current_time,
         pedestrian_stop,
+        stop_target,
     )
 
     return result, candidate, constraint_values, leader_positions
@@ -500,7 +579,7 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
 
     state = get_pedestrian_state(current_time)
     previous_mode_is_latched = (previous_pedestrian_mode == "stopping" and state in ("warning", "active"))
-    
+
     diagnostics = {
         "success": False,
         "status": -1,
@@ -615,6 +694,11 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
     # --------------------------------------------------------
     elif state == "active" and current_position < _pedestrian_clearance_position():
         active_guess = normal_candidate if normal_feasible else initial_guess
+        stop_target = min(leader_position - VEHICLE_LENGTH - PEDESTRIAN_QUEUE_STANDSTILL_GAP, X_STOP)
+
+        diagnostics["stop_target_position"] = float(stop_target)
+        physically_can_stop = _can_physically_stop(current_position, current_speed, stop_target)
+        diagnostics["physically_can_stop"] = physically_can_stop
 
         stop_result, stop_candidate, stop_constraints, _ = _solve_mpc(
             current_position=current_position,
@@ -662,8 +746,17 @@ def compute_av_acceleration(current_position, current_speed, leader_position, le
     # --------------------------------------------------------
     if not diagnostics["success"]:
         if chosen_mode in ("stopping", "dilemma"):
-            # Use the strongest available AV braking as the emergency action.
-            fallback_acceleration = AV_ACCEL_MIN
+            stop_target = diagnostics.get("stop_target_position", None)
+
+            if (stop_target is not None):
+                fallback_acceleration = _fallback_stop_acceleration(
+                    current_position=current_position,
+                    current_speed=current_speed,
+                    stop_target=stop_target,
+                )
+            else:
+                fallback_acceleration = AV_ACCEL_MIN
+
         else:
             fallback_acceleration = float(np.clip(previous_acceleration, AV_ACCEL_MIN, AV_ACCEL_MAX))
 

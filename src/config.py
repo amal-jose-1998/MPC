@@ -10,7 +10,7 @@ DESIRED_GAP = 10.0           # [m] Desired gap between vehicles
 HDV_ACCEL_MIN = -8.0           # [m/s^2]
 HDV_ACCEL_MAX = 3.0            # [m/s^2]
 HDV_SPEED_MAX = 25.0           # [m/s]
-MIN_GAP = 2.0                  # Minimum bumper-to-bumper gap [m]
+MIN_GAP = 3.0                  # Minimum bumper-to-bumper gap [m]
 
 # Vehicle geometry
 VEHICLE_LENGTH = 4.5         # Assumed common vehicle length [m]
@@ -55,6 +55,7 @@ AV_ACCEL_MIN = -8.0       # m/s²
 AV_ACCEL_MAX = 3.0        # m/s²
 AV_SPEED_MAX = 25.0       # m/s
 AV_DESIRED_SPEED = 20.0   # m/s
+AV_SAFE_BRAKE = 2.0       # m/s² 
 
 # ============================================================
 # AV MPC
