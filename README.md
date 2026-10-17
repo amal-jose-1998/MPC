@@ -6,6 +6,11 @@ HDVs follow a car-following model with pedestrian-response rules. AVs use model 
 
 The Jupyter notebook runs the simulation and visualizes vehicle positions, speeds, accelerations, gaps, pedestrian states, controller modes, and solver diagnostics.
 
+## Demo
+
+A 25 Hz simulation recording showing the pedestrian-aware MPC controller in mixed traffic.
+
+[▶️ View the simulation video](results/simulation_with_ped/recording_25Hz.mp4)
 ## Scenario
 
 The reference scenario uses:
